@@ -3,6 +3,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <sys/mount.h>
+#include <dirent.h>
 
 #include "common/config.h"
 #include "int.h"
@@ -22,6 +23,10 @@
 
 #include "images/mnt.pb-c.h"
 #include "images/binfmt-misc.pb-c.h"
+
+/* Forward declaration for GPU rebind helper used in multiple restore paths. */
+struct mount_info;
+static void devtmpfs_rebind_gpu_devices(struct mount_info *pm);
 
 static int attach_option(struct mount_info *pm, char *opt)
 {
@@ -465,6 +470,32 @@ static int tmpfs_restore(struct mount_info *pm)
 }
 
 /*
+ * Wrapper around tmpfs_restore that, for the /dev mount, rebinds host GPU
+ * devices (/dev/nvidia*, /dev/nvidiactl, etc.) into the restored tmpfs.
+ * This is needed on setups where the container's /dev is tmpfs rather than
+ * devtmpfs, so the devtmpfs_* helpers are not used.
+ */
+static int tmpfs_restore_gpu_aware(struct mount_info *pm)
+{
+	int ret;
+
+	ret = tmpfs_restore(pm);
+	if (ret)
+		return ret;
+
+	/*
+	 * Only do GPU rebinding for the /dev mount. For other tmpfs mounts
+	 * (e.g. /dev/shm, /run) we leave the restored contents unchanged.
+	 */
+	if (pm->ns_mountpoint && !strcmp(pm->ns_mountpoint, "/dev"))
+		devtmpfs_rebind_gpu_devices(pm);
+
+	return ret;
+}
+
+/* tmpfs_restore_gpu_aware was removed; keep plain tmpfs_restore. */
+
+/*
  * Virtualized devtmpfs on any side (dump or restore)
  * means, that we should try to handle it as a plain
  * tmpfs.
@@ -497,6 +528,126 @@ static int devtmpfs_restore(struct mount_info *pm)
 	ret = devtmpfs_virtual(pm);
 	if (ret == 1)
 		ret = tmpfs_restore(pm);
+
+	return ret;
+}
+
+/*
+ * For containers using GPU CDI / runtime-managed devices, we don't want the
+ * /dev image to permanently override the runtime-provided /dev/nvidia*
+ * device nodes. As a pragmatic workaround, after restoring /dev from the
+ * image, re-bind host GPU char devices into the restored /dev tree so that
+ * they reflect the current node's GPUs.
+ *
+ * This operates purely at the filesystem level and does not affect CUDA
+ * state migration (handled by the CUDA plugin & cuda-checkpoint).
+ */
+static void devtmpfs_rebind_gpu_devices(struct mount_info *pm)
+{
+	const char *svc_dev;
+	DIR *dir;
+	struct dirent *de;
+	char host_path[PATH_MAX];
+	char cont_path[PATH_MAX];
+	uid_t gpu_uid = (uid_t)-1;
+	gid_t gpu_gid = (gid_t)-1;
+
+	svc_dev = service_mountpoint(pm);
+	if (!svc_dev)
+		return;
+
+	dir = opendir("/dev");
+	if (!dir) {
+		pr_perror("devtmpfs: unable to open host /dev for GPU rebinding");
+		return;
+	}
+
+	pr_info("devtmpfs: rebinding host GPU devices into %s\n", svc_dev);
+
+	while ((de = readdir(dir)) != NULL) {
+		const char *name = de->d_name;
+		struct stat st_host, st_cont;
+
+		if (!name || name[0] == '.' || !strcmp(name, ".."))
+			continue;
+
+		/* Match common NVIDIA device names */
+		if (strcmp(name, "nvidiactl") &&
+		    strncmp(name, "nvidia", strlen("nvidia")) &&
+		    strncmp(name, "nvidia-uvm", strlen("nvidia-uvm")) &&
+		    strncmp(name, "nvidia-modeset", strlen("nvidia-modeset")))
+			continue;
+
+		if (snprintf(host_path, sizeof(host_path), "/dev/%s", name) >= (int)sizeof(host_path))
+			continue;
+
+		if (stat(host_path, &st_host) < 0) {
+			pr_perror("devtmpfs: stat failed for %s", host_path);
+			continue;
+		}
+
+		if (!S_ISCHR(st_host.st_mode))
+			continue;
+
+		if (snprintf(cont_path, sizeof(cont_path), "%s/%s", svc_dev, name) >= (int)sizeof(cont_path))
+			continue;
+
+		/*
+		 * Ensure the target path exists in the restored /dev. If it
+		 * wasn't present in the checkpoint image, create a fresh char
+		 * device node mirroring the host's major/minor. When the node
+		 * already exists (normal case for allowed GPUs), keep its
+		 * original container permissions.
+		 */
+		if (stat(cont_path, &st_cont) < 0) {
+			mode_t mode = st_host.st_mode;
+
+			if (errno != ENOENT) {
+				pr_perror("devtmpfs: stat failed for container path %s", cont_path);
+				continue;
+			}
+
+			if (mknod(cont_path, mode, st_host.st_rdev) < 0) {
+				pr_perror("devtmpfs: failed to create container GPU node %s", cont_path);
+				continue;
+			}
+
+			/* Apply template ownership if we have one */
+			if (gpu_uid != (uid_t)-1 || gpu_gid != (gid_t)-1) {
+				if (chown(cont_path,
+					  gpu_uid != (uid_t)-1 ? gpu_uid : (uid_t)-1,
+					  gpu_gid != (gid_t)-1 ? gpu_gid : (gid_t)-1) < 0)
+					pr_perror("devtmpfs: failed to chown %s", cont_path);
+			}
+
+			pr_info("devtmpfs: created container GPU node %s (rdev %d:%d, mode %o)\n",
+				cont_path, (int)major(st_host.st_rdev), (int)minor(st_host.st_rdev),
+				(unsigned int)(mode & 0777));
+		} else {
+			/* Node already existed; remember its ownership as template and keep its mode. */
+			if (S_ISCHR(st_cont.st_mode)) {
+				if (gpu_uid == (uid_t)-1)
+					gpu_uid = st_cont.st_uid;
+				if (gpu_gid == (gid_t)-1)
+					gpu_gid = st_cont.st_gid;
+			}
+			pr_info("devtmpfs: keeping existing container GPU node %s (mode %o)\n",
+				cont_path, (unsigned int)(st_cont.st_mode & 0777));
+		}
+	}
+
+	closedir(dir);
+}
+
+static int devtmpfs_restore_gpu_aware(struct mount_info *pm)
+{
+	int ret;
+
+	ret = devtmpfs_restore(pm);
+	if (ret)
+		return ret;
+
+	devtmpfs_rebind_gpu_devices(pm);
 
 	return ret;
 }
@@ -685,7 +836,7 @@ static struct fstype fstypes[] = {
 		.name = "devtmpfs",
 		.code = FSTYPE__DEVTMPFS,
 		.dump = devtmpfs_dump,
-		.restore = devtmpfs_restore,
+		.restore = devtmpfs_restore_gpu_aware,
 	},
 	{
 		.name = "binfmt_misc",
@@ -699,7 +850,7 @@ static struct fstype fstypes[] = {
 		.name = "tmpfs",
 		.code = FSTYPE__TMPFS,
 		.dump = tmpfs_dump,
-		.restore = tmpfs_restore,
+		.restore = tmpfs_restore_gpu_aware,
 	},
 	{
 		.name = "devpts",

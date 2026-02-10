@@ -2723,6 +2723,32 @@ static int set_unbindable(struct mount_info *mi)
 	return 0;
 }
 
+/*
+ * Check if mount is for an NVIDIA GPU device under /dev.
+ * See is_nvidia_dev_mount() in mount-v2.c for full explanation.
+ */
+static bool is_nvidia_dev_mount(struct mount_info *mi)
+{
+	const char *mp = mi->ns_mountpoint;
+	const char *name;
+
+	if (!mp)
+		return false;
+
+	if (strncmp(mp, "/dev/nvidia", 11) != 0)
+		return false;
+
+	name = mp + 5; /* skip "/dev/" */
+
+	if (!strcmp(name, "nvidiactl") ||
+	    !strncmp(name, "nvidia-uvm", 10) ||
+	    !strncmp(name, "nvidia-modeset", 14) ||
+	    !strncmp(name, "nvidia", 6))
+		return true;
+
+	return false;
+}
+
 static int do_mount_one(struct mount_info *mi)
 {
 	int ret;
@@ -2733,6 +2759,19 @@ static int do_mount_one(struct mount_info *mi)
 	if (!can_mount_now(mi)) {
 		pr_debug("Postpone mount %s(%d)\n", mi->ns_mountpoint, mi->mnt_id);
 		return 1;
+	}
+
+	/*
+	 * Skip bind-mounts for NVIDIA GPU devices under /dev.
+	 * The device nodes have already been fixed up in the parent
+	 * tmpfs/devtmpfs by devtmpfs_rebind_gpu_devices().
+	 */
+	if (mi->bind && is_nvidia_dev_mount(mi)) {
+		pr_info("mnt: skipping nvidia device mount %d @ %s "
+			"(handled by devtmpfs GPU fixup)\n",
+			mi->mnt_id, mi->ns_mountpoint);
+		mi->mounted = true;
+		return 0;
 	}
 
 	if ((mi->parent && mi->parent != root_yard_mp) && !strcmp(mi->parent->ns_mountpoint, mi->ns_mountpoint)) {

@@ -562,7 +562,7 @@ static void devtmpfs_rebind_gpu_devices(struct mount_info *pm)
 		return;
 	}
 
-	pr_info("devtmpfs: rebinding host GPU devices into %s\n", svc_dev);
+	pr_info("devtmpfs: fixing up host GPU devices in %s\n", svc_dev);
 
 	while ((de = readdir(dir)) != NULL) {
 		const char *name = de->d_name;
@@ -593,26 +593,68 @@ static void devtmpfs_rebind_gpu_devices(struct mount_info *pm)
 			continue;
 
 		/*
-		 * Ensure the target path exists in the restored /dev. If it
-		 * wasn't present in the checkpoint image, create a fresh char
-		 * device node mirroring the host's major/minor. When the node
-		 * already exists (normal case for allowed GPUs), keep its
-		 * original container permissions.
+		 * Check if the node already exists in the restored /dev.
+		 * If so, check whether its rdev matches the current host.
+		 * If not, replace it with a new node that has the correct
+		 * major/minor, preserving the original permissions/ownership.
+		 *
+		 * We intentionally avoid bind-mounts here because they are
+		 * separate mount entries that get lost when the mount tree
+		 * is reassembled (move_mount). By modifying the tmpfs content
+		 * directly (unlink + mknod), the changes persist.
 		 */
-		if (stat(cont_path, &st_cont) < 0) {
-			mode_t mode = st_host.st_mode;
+		if (stat(cont_path, &st_cont) == 0) {
+			/* Remember first existing node's ownership as template */
+			if (S_ISCHR(st_cont.st_mode)) {
+				if (gpu_uid == (uid_t)-1)
+					gpu_uid = st_cont.st_uid;
+				if (gpu_gid == (gid_t)-1)
+					gpu_gid = st_cont.st_gid;
+			}
 
-			if (errno != ENOENT) {
-				pr_perror("devtmpfs: stat failed for container path %s", cont_path);
+			if (S_ISCHR(st_cont.st_mode) &&
+			    st_cont.st_rdev == st_host.st_rdev) {
+				/* rdev already matches the current host */
+				pr_info("devtmpfs: GPU node %s rdev %d:%d matches host, keeping\n",
+					name, (int)major(st_host.st_rdev),
+					(int)minor(st_host.st_rdev));
 				continue;
 			}
 
-			if (mknod(cont_path, mode, st_host.st_rdev) < 0) {
-				pr_perror("devtmpfs: failed to create container GPU node %s", cont_path);
+			/*
+			 * rdev differs (cross-node migration) or not a char
+			 * device. Replace the node with one that has the
+			 * correct major/minor from this host.
+			 */
+			pr_info("devtmpfs: GPU node %s rdev %d:%d -> %d:%d (host), recreating\n",
+				name,
+				(int)major(st_cont.st_rdev), (int)minor(st_cont.st_rdev),
+				(int)major(st_host.st_rdev), (int)minor(st_host.st_rdev));
+
+			if (unlink(cont_path) < 0) {
+				pr_perror("devtmpfs: failed to unlink %s", cont_path);
 				continue;
 			}
 
-			/* Apply template ownership if we have one */
+			if (mknod(cont_path, st_cont.st_mode, st_host.st_rdev) < 0) {
+				pr_perror("devtmpfs: failed to mknod %s", cont_path);
+				continue;
+			}
+
+			/* Preserve original ownership */
+			if (chown(cont_path, st_cont.st_uid, st_cont.st_gid) < 0)
+				pr_perror("devtmpfs: failed to chown %s", cont_path);
+		} else if (errno == ENOENT) {
+			/*
+			 * Node doesn't exist in the checkpoint image.
+			 * Create it with the host's rdev.
+			 */
+			if (mknod(cont_path, st_host.st_mode, st_host.st_rdev) < 0) {
+				pr_perror("devtmpfs: failed to create GPU node %s", cont_path);
+				continue;
+			}
+
+			/* Apply template ownership from existing container nodes */
 			if (gpu_uid != (uid_t)-1 || gpu_gid != (gid_t)-1) {
 				if (chown(cont_path,
 					  gpu_uid != (uid_t)-1 ? gpu_uid : (uid_t)-1,
@@ -620,19 +662,12 @@ static void devtmpfs_rebind_gpu_devices(struct mount_info *pm)
 					pr_perror("devtmpfs: failed to chown %s", cont_path);
 			}
 
-			pr_info("devtmpfs: created container GPU node %s (rdev %d:%d, mode %o)\n",
-				cont_path, (int)major(st_host.st_rdev), (int)minor(st_host.st_rdev),
-				(unsigned int)(mode & 0777));
+			pr_info("devtmpfs: created GPU node %s (rdev %d:%d)\n",
+				cont_path, (int)major(st_host.st_rdev),
+				(int)minor(st_host.st_rdev));
 		} else {
-			/* Node already existed; remember its ownership as template and keep its mode. */
-			if (S_ISCHR(st_cont.st_mode)) {
-				if (gpu_uid == (uid_t)-1)
-					gpu_uid = st_cont.st_uid;
-				if (gpu_gid == (gid_t)-1)
-					gpu_gid = st_cont.st_gid;
-			}
-			pr_info("devtmpfs: keeping existing container GPU node %s (mode %o)\n",
-				cont_path, (unsigned int)(st_cont.st_mode & 0777));
+			pr_perror("devtmpfs: stat failed for container path %s", cont_path);
+			continue;
 		}
 	}
 

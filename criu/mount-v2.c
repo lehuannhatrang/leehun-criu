@@ -711,6 +711,40 @@ err:
 	return exit_code;
 }
 
+/*
+ * Check if mount is for an NVIDIA GPU device under /dev.
+ * These are bind-mounts originally created by CRI-O/CDI from the
+ * host's /dev into the container. On cross-node migration the source
+ * device has a different major/minor, so restoring the checkpoint's
+ * bind-mount would produce a broken or missing device node.
+ *
+ * We skip these mounts here because devtmpfs_rebind_gpu_devices()
+ * already fixed the device nodes directly inside the /dev tmpfs
+ * with the correct rdev from the current host.
+ */
+static bool is_nvidia_dev_mount(struct mount_info *mi)
+{
+	const char *mp = mi->ns_mountpoint;
+	const char *name;
+
+	if (!mp)
+		return false;
+
+	/* Must be directly under /dev/ (not /dev/foo/bar) */
+	if (strncmp(mp, "/dev/nvidia", 11) != 0)
+		return false;
+
+	name = mp + 5; /* skip "/dev/" */
+
+	if (!strcmp(name, "nvidiactl") ||
+	    !strncmp(name, "nvidia-uvm", 10) ||
+	    !strncmp(name, "nvidia-modeset", 14) ||
+	    !strncmp(name, "nvidia", 6))
+		return true;
+
+	return false;
+}
+
 static int do_mount_one_v2(struct mount_info *mi)
 {
 	int ret;
@@ -721,6 +755,20 @@ static int do_mount_one_v2(struct mount_info *mi)
 	if (!can_mount_now_v2(mi)) {
 		pr_debug("Postpone mount %d\n", mi->mnt_id);
 		return 1;
+	}
+
+	/*
+	 * Skip bind-mounts for NVIDIA GPU devices under /dev.
+	 * The device nodes have already been fixed up in the parent
+	 * tmpfs/devtmpfs by devtmpfs_rebind_gpu_devices() with the
+	 * correct major/minor from this host.
+	 */
+	if (mi->bind && is_nvidia_dev_mount(mi)) {
+		pr_info("mnt-v2: skipping nvidia device mount %d @ %s "
+			"(handled by devtmpfs GPU fixup)\n",
+			mi->mnt_id, mi->ns_mountpoint);
+		mi->mounted = true;
+		return 0;
 	}
 
 	if (detect_is_dir(mi))

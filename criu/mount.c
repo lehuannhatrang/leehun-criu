@@ -2724,6 +2724,44 @@ static int set_unbindable(struct mount_info *mi)
 }
 
 /*
+ * Check if a sysfs mount refers to a CPU that does not exist on this
+ * host.  See is_invalid_cpu_mount() in mount-v2.c for full explanation.
+ */
+static bool is_invalid_cpu_mount(struct mount_info *mi)
+{
+	const char *mp = mi->ns_mountpoint;
+	const char *p;
+	long cpu_id;
+	char *end;
+	long nr_cpus;
+
+	if (!mp)
+		return false;
+
+	p = strstr(mp, "/devices/system/cpu/cpu");
+	if (!p)
+		return false;
+
+	p += strlen("/devices/system/cpu/cpu");
+
+	if (*p < '0' || *p > '9')
+		return false;
+
+	cpu_id = strtol(p, &end, 10);
+	if (end == p)
+		return false;
+
+	if (*end != '/' && *end != '\0')
+		return false;
+
+	nr_cpus = sysconf(_SC_NPROCESSORS_CONF);
+	if (nr_cpus <= 0)
+		return false;
+
+	return cpu_id >= nr_cpus;
+}
+
+/*
  * Check if mount is for an NVIDIA GPU device under /dev.
  * See is_nvidia_dev_mount() in mount-v2.c for full explanation.
  */
@@ -2759,6 +2797,19 @@ static int do_mount_one(struct mount_info *mi)
 	if (!can_mount_now(mi)) {
 		pr_debug("Postpone mount %s(%d)\n", mi->ns_mountpoint, mi->mnt_id);
 		return 1;
+	}
+
+	/*
+	 * Skip sysfs bind-mounts that refer to CPUs which do not
+	 * exist on this host (cross-node migration to a smaller node).
+	 */
+	if (is_invalid_cpu_mount(mi)) {
+		pr_info("mnt: skipping mount %d @ %s "
+			"(cpu does not exist on this host)\n",
+			mi->mnt_id, mi->ns_mountpoint);
+		mi->mounted = true;
+		mi->skipped = true;
+		return 0;
 	}
 
 	/*

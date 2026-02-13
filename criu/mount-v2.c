@@ -539,6 +539,9 @@ static bool can_mount_now_v2(struct mount_info *mi)
 
 static int __set_unbindable_v2(struct mount_info *mi)
 {
+	if (mi->skipped)
+		return 0;
+
 	if (mi->flags & MS_UNBINDABLE) {
 		if (mount(NULL, service_mountpoint(mi), NULL, MS_UNBINDABLE, NULL)) {
 			pr_perror("Failed to set mount %d unbindable", mi->mnt_id);
@@ -712,6 +715,55 @@ err:
 }
 
 /*
+ * Check if a sysfs mount refers to a CPU index that does not exist on
+ * the current host.  This happens during cross-node migration when the
+ * source node had more CPUs than the destination.  Rather than failing
+ * the restore outright we skip these mounts (and any children beneath
+ * them) so the container can still come up on a smaller machine.
+ *
+ * Paths we look for:
+ *   /sys/devices/system/cpu/cpuN[/...]
+ *   /devices/system/cpu/cpuN[/...]          (root-relative variant)
+ */
+static bool is_invalid_cpu_mount(struct mount_info *mi)
+{
+	const char *mp = mi->ns_mountpoint;
+	const char *p;
+	long cpu_id;
+	char *end;
+	long nr_cpus;
+
+	if (!mp)
+		return false;
+
+	/* Try both absolute /sys/... and relative /devices/... prefixes */
+	p = strstr(mp, "/devices/system/cpu/cpu");
+	if (!p)
+		return false;
+
+	/* Advance past "/devices/system/cpu/cpu" to reach the digit(s) */
+	p += strlen("/devices/system/cpu/cpu");
+
+	/* Must start with a digit */
+	if (*p < '0' || *p > '9')
+		return false;
+
+	cpu_id = strtol(p, &end, 10);
+	if (end == p)
+		return false;
+
+	/* After the digits we expect '/' or '\0' (exact cpuN path) */
+	if (*end != '/' && *end != '\0')
+		return false;
+
+	nr_cpus = sysconf(_SC_NPROCESSORS_CONF);
+	if (nr_cpus <= 0)
+		return false;
+
+	return cpu_id >= nr_cpus;
+}
+
+/*
  * Check if mount is for an NVIDIA GPU device under /dev.
  * These are bind-mounts originally created by CRI-O/CDI from the
  * host's /dev into the container. On cross-node migration the source
@@ -755,6 +807,19 @@ static int do_mount_one_v2(struct mount_info *mi)
 	if (!can_mount_now_v2(mi)) {
 		pr_debug("Postpone mount %d\n", mi->mnt_id);
 		return 1;
+	}
+
+	/*
+	 * Skip sysfs bind-mounts that refer to CPUs which do not
+	 * exist on this host (cross-node migration to a smaller node).
+	 */
+	if (is_invalid_cpu_mount(mi)) {
+		pr_info("mnt-v2: skipping mount %d @ %s "
+			"(cpu does not exist on this host)\n",
+			mi->mnt_id, mi->ns_mountpoint);
+		mi->mounted = true;
+		mi->skipped = true;
+		return 0;
 	}
 
 	/*
@@ -837,6 +902,9 @@ static int populate_mnt_ns_v2(void)
 static int move_mount_to_tree(struct mount_info *mi)
 {
 	int fd;
+
+	if (mi->skipped)
+		return 0;
 
 	fd = open(mi->mountpoint, O_PATH);
 	if (fd < 0) {

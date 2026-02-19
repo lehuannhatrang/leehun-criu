@@ -13,12 +13,14 @@ fi
 	build-essential \
 	gdb \
 	git-core \
+	iproute2 \
 	iptables \
 	kmod \
 	libaio-dev \
 	libbsd-dev \
 	libcap-dev \
 	libdrm-dev \
+	libelf-dev \
 	libgnutls28-dev \
 	libgnutls30 \
 	libnet-dev \
@@ -28,6 +30,8 @@ fi
 	libprotobuf-c-dev \
 	libprotobuf-dev \
 	libselinux-dev \
+	libtraceevent-dev \
+	libtracefs-dev \
 	pkg-config \
 	protobuf-c-compiler \
 	protobuf-compiler \

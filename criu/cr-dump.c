@@ -2138,8 +2138,10 @@ int cr_dump_tasks(pid_t pid)
 	InventoryEntry he = INVENTORY_ENTRY__INIT;
 	InventoryEntry *parent_ie = NULL;
 	struct pstree_item *item;
-	int pre_dump_ret = 0;
-	int ret = -1;
+	int ret;
+	int exit_code = -1;
+
+	kerndat_warn_about_madv_guards();
 
 	kerndat_warn_about_madv_guards();
 
@@ -2159,9 +2161,9 @@ int cr_dump_tasks(pid_t pid)
 		goto err;
 	root_item->pid->real = pid;
 
-	pre_dump_ret = run_scripts(ACT_PRE_DUMP);
-	if (pre_dump_ret != 0) {
-		pr_err("Pre dump script failed with %d!\n", pre_dump_ret);
+	ret = run_scripts(ACT_PRE_DUMP);
+	if (ret != 0) {
+		pr_err("Pre dump script failed with %d!\n", ret);
 		goto err;
 	}
 	if (init_stats(DUMP_STATS))
@@ -2247,6 +2249,10 @@ int cr_dump_tasks(pid_t pid)
 			goto err;
 	}
 
+	ret = run_plugins(DUMP_DEVICES_LATE, pid);
+	if (ret && ret != -ENOTSUP)
+		goto err;
+
 	if (parent_ie) {
 		inventory_entry__free_unpacked(parent_ie, NULL);
 		parent_ie = NULL;
@@ -2283,49 +2289,44 @@ int cr_dump_tasks(pid_t pid)
 	 * ipc shared memory, but an ipc namespace is dumped in a child
 	 * process.
 	 */
-	ret = cr_dump_shmem();
-	if (ret)
+	if (cr_dump_shmem())
 		goto err;
 
 	if (root_ns_mask) {
-		ret = dump_namespaces(root_item, root_ns_mask);
-		if (ret)
+		if (dump_namespaces(root_item, root_ns_mask))
 			goto err;
 	}
 
 	if ((root_ns_mask & CLONE_NEWTIME) == 0) {
-		ret = dump_time_ns(0);
-		if (ret)
+		if (dump_time_ns(0))
 			goto err;
 	}
 
 	if (dump_aa_namespaces() < 0)
 		goto err;
 
-	ret = dump_cgroups();
-	if (ret)
+	if (dump_cgroups())
 		goto err;
 
-	ret = fix_external_unix_sockets();
-	if (ret)
+	if (fix_external_unix_sockets())
 		goto err;
 
-	ret = tty_post_actions();
-	if (ret)
+	if (tty_post_actions())
 		goto err;
 
-	ret = inventory_save_uptime(&he);
-	if (ret)
+	if (inventory_save_uptime(&he))
 		goto err;
 
 	he.has_pre_dump_mode = false;
+	if (found_uprobes_vma()) {
+		he.has_allow_uprobes = true;
+		he.allow_uprobes = true;
+	}
 
-	ret = write_img_inventory(&he);
-	if (ret)
-		goto err;
+	exit_code = write_img_inventory(&he);
 err:
 	if (parent_ie)
 		inventory_entry__free_unpacked(parent_ie, NULL);
 
-	return cr_dump_finish(ret);
+	return cr_dump_finish(exit_code);
 }

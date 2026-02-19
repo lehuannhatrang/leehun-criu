@@ -105,6 +105,7 @@ mmap_status_map = [
     ('VMA_AREA_AIORING', 1 << 13),
     ('VMA_AREA_MEMFD', 1 << 14),
     ('VMA_AREA_SHSTK', 1 << 15),
+    ('VMA_AREA_UPROBES', 1 << 17),
     ('VMA_UNSUPP', 1 << 31),
 ]
 
@@ -153,8 +154,9 @@ flags_maps = {
 gen_maps = {
     'task_state': {
         1: 'Alive',
-        3: 'Zombie',
-        6: 'Stopped'
+        2: 'Dead',
+        3: 'Stopped',
+        6: 'Zombie',
     },
 }
 

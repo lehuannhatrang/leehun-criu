@@ -66,6 +66,11 @@ endif
         export PKG_CONFIG_PATH
 endif
 
+ifeq ($(SHSTK_ENABLE),1)
+        CFLAGS  += -mshstk
+        LDFLAGS += -Wl,-z,shstk
+endif
+
 define pkg-libs
         $(shell PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" $(PKG_CONFIG) --libs $(1))
 endef
@@ -73,6 +78,14 @@ endef
 define pkg-cflags
         $(shell PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" $(PKG_CONFIG) --cflags $(1))
 endef
+
+ifeq ($(GCS_ENABLE),1)
+        CFLAGS  += -mbranch-protection=standard
+        LDFLAGS += -z experimental-gcs=check
+        TEST_ENV = GLIBC_TUNABLES=glibc.cpu.aarch64_gcs=1:glibc.cpu.aarch64_gcs_policy=2
+else
+        TEST_ENV =
+endif
 
 %.d: %.c
 	$(E) " DEP      " $@

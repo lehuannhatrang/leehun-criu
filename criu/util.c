@@ -195,6 +195,7 @@ static void vma_opt_str(const struct vma_area *v, char *opt)
 	opt2s(VMA_ANON_PRIVATE, "ap");
 	opt2s(VMA_AREA_SYSVIPC, "sysv");
 	opt2s(VMA_AREA_SOCKET, "sk");
+	opt2s(VMA_AREA_UPROBES, "uprobes");
 
 #undef opt2s
 }
@@ -221,10 +222,9 @@ int close_safe(int *fd)
 
 	if (*fd > -1) {
 		ret = close(*fd);
-		if (!ret)
-			*fd = -1;
-		else
-			pr_perror("Unable to close fd %d", *fd);
+		if (ret)
+			pr_perror("Failed closing fd %d", *fd);
+		*fd = -1;
 	}
 
 	return ret;

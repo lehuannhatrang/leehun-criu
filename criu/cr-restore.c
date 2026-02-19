@@ -250,9 +250,6 @@ static int crtools_prepare_shared(void)
 	if (!files_collected() && collect_image(&inet_sk_cinfo))
 		return -1;
 
-	if (collect_binfmt_misc())
-		return -1;
-
 	if (tty_prep_fds())
 		return -1;
 
@@ -1670,6 +1667,11 @@ static int __restore_task_with_children(void *_arg)
 	restore_pgid();
 
 	if (current->parent == NULL) {
+		if (root_ns_mask & CLONE_NEWUSER)
+			/* Do this after user ns and mnt ns have been set up */
+			if (restore_userns_binfmt_misc(current))
+				goto err;
+
 		/*
 		 * Wait when all tasks passed the CR_STATE_FORKING stage.
 		 * The stage was started by criu, but now it waits for

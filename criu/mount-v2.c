@@ -833,6 +833,7 @@ static int do_mount_one_v2(struct mount_info *mi)
 			"(handled by devtmpfs GPU fixup)\n",
 			mi->mnt_id, mi->ns_mountpoint);
 		mi->mounted = true;
+		mi->skipped = true;
 		return 0;
 	}
 
